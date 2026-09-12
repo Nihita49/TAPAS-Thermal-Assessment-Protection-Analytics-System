@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/outbox.jsonl
+data/history.jsonl
+.venv/
