@@ -373,6 +373,7 @@ class Live:
             r=fetch_many(locs,max_workers=14)
             # retry failures once
             fails=[k for k,res in r.items() if res[0]!="ok"]
+            if fails: print(f"[weather] {city}: {len(fails)}/{len(locs)} failed — sample: {r[fails[0]][1]}", flush=True)
             if fails:
                 fl={k:locs[k] for k in fails}
                 _t.sleep(0.5)
