@@ -371,7 +371,7 @@ class Live:
             g=unique_grid(city); self.grid[city]=g
             locs={k:(g[k][0]["centroid"][1],g[k][0]["centroid"][0]) for k in g}
             try:
-                batch=fetch_batch(locs)
+                first_id=next(iter(locs)); batch=fetch_batch({first_id: locs[first_id]})
                 r={k:("ok",rec) for k,rec in batch.items()}
             except Exception as e:
                 print(f"[weather] {city}: batch request failed — {type(e).__name__}: {e}", flush=True)
