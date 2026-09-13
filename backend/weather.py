@@ -75,3 +75,23 @@ def fetch_many(centroids, max_workers=8, forecast_days=6):
         for wid, res in ex.map(one, centroids.items()):
             out[wid] = res
     return out
+
+def fetch_batch(centroids, forecast_days=6):
+    """Fetch weather for MANY locations in a single Open-Meteo request, using
+    its comma-separated multi-location support (up to ~1000 locations per
+    call) instead of one HTTP request per location. Returns {ward_id: record}
+    for every location on success; raises on total failure (caller falls back)."""
+    items = list(centroids.items())
+    lats = ",".join(str(round(lat, 4)) for _, (lat, lon) in items)
+    lons = ",".join(str(round(lon, 4)) for _, (lat, lon) in items)
+    r = requests.get(BASE, params={
+        "latitude": lats, "longitude": lons,
+        "hourly": HOURLY, "daily": DAILY,
+        "timezone": "auto", "forecast_days": forecast_days,
+        "past_days": 2,
+    }, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        data = [data]
+    return {wid: rec for (wid, _), rec in zip(items, data)}

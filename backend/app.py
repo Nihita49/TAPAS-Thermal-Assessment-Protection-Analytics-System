@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from pythermalcomfort.models import utci
 
 from datastore import STORE, CITY_IDS
-from weather import fetch_many, synth_weather
+from weather import fetch_batch, synth_weather
 from measures import admin_actions, user_sms
 from measures_i18n import personal_multilang, personal_oneline, emergency_multilang
 import pg_store
@@ -370,16 +370,21 @@ class Live:
         for city in CITY_IDS:
             g=unique_grid(city); self.grid[city]=g
             locs={k:(g[k][0]["centroid"][1],g[k][0]["centroid"][0]) for k in g}
-            r=fetch_many(locs,max_workers=3)
-            # retry failures once, with a real backoff so we don't just get 429'd again immediately
+            try:
+                batch=fetch_batch(locs)
+                r={k:("ok",rec) for k,rec in batch.items()}
+            except Exception as e:
+                print(f"[weather] {city}: batch request failed — {type(e).__name__}: {e}", flush=True)
+                r={k:("err",str(e)) for k in locs}
             fails=[k for k,res in r.items() if res[0]!="ok"]
-            if fails: print(f"[weather] {city}: {len(fails)}/{len(locs)} failed — sample: {r[fails[0]][1]}", flush=True)
             if fails:
-                fl={k:locs[k] for k in fails}
-                _t.sleep(8)
-                r2=fetch_many(fl,max_workers=2)
-                for k,res in r2.items():
-                    if res[0]=="ok": r[k]=res
+                print(f"[weather] {city}: {len(fails)}/{len(locs)} failed on first batch", flush=True)
+                _t.sleep(3)
+                try:
+                    batch2=fetch_batch({k:locs[k] for k in fails})
+                    for k,rec in batch2.items(): r[k]=("ok",rec)
+                except Exception as e:
+                    print(f"[weather] {city}: retry batch also failed — {type(e).__name__}: {e}", flush=True)
             recs={}
             for k,res in r.items():
                 if res[0]=="ok":
@@ -388,7 +393,7 @@ class Live:
                     w=g[k][0]; s=synth_weather(w["centroid"][1],w["centroid"][0],now)
                     s["_prov"]="fallback"; recs[k]={"rec":s,"prov":"fallback"}
             self.records[city]=recs
-            _t.sleep(3)
+            _t.sleep(1)
         self.last=now
     def prov(self,city):
         recs=self.records.get(city)
