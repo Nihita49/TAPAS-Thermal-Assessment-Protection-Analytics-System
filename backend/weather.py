@@ -76,22 +76,89 @@ def fetch_many(centroids, max_workers=8, forecast_days=6):
             out[wid] = res
     return out
 
-def fetch_batch(centroids, forecast_days=6):
-    """Fetch weather for MANY locations in a single Open-Meteo request, using
-    its comma-separated multi-location support (up to ~1000 locations per
-    call) instead of one HTTP request per location. Returns {ward_id: record}
-    for every location on success; raises on total failure (caller falls back)."""
-    items = list(centroids.items())
-    lats = ",".join(str(round(lat, 4)) for _, (lat, lon) in items)
-    lons = ",".join(str(round(lon, 4)) for _, (lat, lon) in items)
-    r = requests.get(BASE, params={
-        "latitude": lats, "longitude": lons,
-        "hourly": HOURLY, "daily": DAILY,
-        "timezone": "auto", "forecast_days": forecast_days,
-        "past_days": 2,
+import os as _os
+
+VC_BASE = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
+VC_API_KEY = _os.environ.get("VISUALCROSSING_API_KEY", "")
+VC_ELEMENTS = "datetime,temp,humidity,windspeed,solarradiation,tempmax,tempmin"
+
+
+def _vc_to_openmeteo_shape(data):
+    """Reshape a Visual Crossing Timeline response into the exact same
+    {"hourly": {...}, "daily": {...}} structure Open-Meteo used, so no
+    downstream code (severity/UTCI/anomaly calc) needs to change."""
+    times, t2, rh, ws, sw, daily_max = [], [], [], [], [], []
+    for day in data.get("days", []):
+        if day.get("tempmax") is not None:
+            daily_max.append(day["tempmax"])
+        for h in day.get("hours", []):
+            times.append(f'{day.get("datetime","")}T{str(h.get("datetime","00:00:00"))[:5]}')
+            t2.append(h.get("temp"))
+            rh.append(h.get("humidity"))
+            ws.append(h.get("windspeed"))
+            sw.append(h.get("solarradiation") or 0)
+    if not times:
+        raise RuntimeError("Visual Crossing returned no hourly data")
+    return {
+        "hourly": {"time": times, "temperature_2m": t2,
+                   "relative_humidity_2m": rh, "wind_speed_10m": ws,
+                   "shortwave_radiation": sw},
+        "daily": {"temperature_2m_max": daily_max},
+    }
+
+
+def fetch_ward_today_vc(lat, lon):
+    """ONE location, TODAY only — the cheapest possible query (1 record).
+    Used for the live per-ward-grid current-conditions fetch, so every ward
+    still gets its own independently-fetched real reading, same as before."""
+    if not VC_API_KEY:
+        raise RuntimeError("VISUALCROSSING_API_KEY not set")
+    today = dt.datetime.now(dt.timezone.utc).date()
+    url = f"{VC_BASE}/{lat},{lon}/{today.isoformat()}"
+    r = requests.get(url, params={
+        "key": VC_API_KEY, "unitGroup": "metric",
+        "include": "hours,days", "contentType": "json",
+        "elements": VC_ELEMENTS,
+    }, timeout=20)
+    r.raise_for_status()
+    return _vc_to_openmeteo_shape(r.json())
+
+
+def fetch_ward_forecast_vc(lat, lon, past_days=1, forecast_days=6):
+    """Extended range for the on-demand 5-day forecast panel — call this only
+    when a user opens that specific ward's forecast, NOT eagerly for every
+    ward, to stay well within the free daily record budget."""
+    if not VC_API_KEY:
+        raise RuntimeError("VISUALCROSSING_API_KEY not set")
+    today = dt.datetime.now(dt.timezone.utc).date()
+    start = today - dt.timedelta(days=past_days)
+    end = today + dt.timedelta(days=forecast_days - 1)
+    url = f"{VC_BASE}/{lat},{lon}/{start.isoformat()}/{end.isoformat()}"
+    r = requests.get(url, params={
+        "key": VC_API_KEY, "unitGroup": "metric",
+        "include": "hours,days", "contentType": "json",
+        "elements": VC_ELEMENTS,
     }, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict):
-        data = [data]
-    return {wid: rec for (wid, _), rec in zip(items, data)}
+    return _vc_to_openmeteo_shape(r.json())
+
+
+def fetch_many_vc(centroids, max_workers=6):
+    """Fetch TODAY's weather for many ward-grid points concurrently, one
+    Visual Crossing request per point (each ward-grid point keeps its own
+    independent live reading — no per-ward granularity is lost).
+    Returns {ward_id: ("ok", record)} or {ward_id: ("err", message)}."""
+    from concurrent.futures import ThreadPoolExecutor
+    out = {}
+
+    def one(item):
+        wid, (lat, lon) = item
+        try:
+            return wid, ("ok", fetch_ward_today_vc(lat, lon))
+        except Exception as e:  # noqa
+            return wid, ("err", f"{type(e).__name__}: {e}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for wid, res in ex.map(one, centroids.items()):
+            out[wid] = res
+    return out
