@@ -366,25 +366,12 @@ class Live:
     def refresh(self,force=False):
         now=dt.datetime.now(dt.timezone.utc)
         if not force and self.last and (now-self.last).total_seconds()<REFRESH_S: return
-        import time as _t
         for city in CITY_IDS:
             g=unique_grid(city); self.grid[city]=g
             locs={k:(g[k][0]["centroid"][1],g[k][0]["centroid"][0]) for k in g}
-            try:
-                first_id=next(iter(locs)); batch=fetch_batch({first_id: locs[first_id]})
-                r={k:("ok",rec) for k,rec in batch.items()}
-            except Exception as e:
-                print(f"[weather] {city}: batch request failed — {type(e).__name__}: {e}", flush=True)
-                r={k:("err",str(e)) for k in locs}
+            r=fetch_many_vc(locs,max_workers=6)
             fails=[k for k,res in r.items() if res[0]!="ok"]
-            if fails:
-                print(f"[weather] {city}: {len(fails)}/{len(locs)} failed on first batch", flush=True)
-                _t.sleep(3)
-                try:
-                    batch2=fetch_batch({k:locs[k] for k in fails})
-                    for k,rec in batch2.items(): r[k]=("ok",rec)
-                except Exception as e:
-                    print(f"[weather] {city}: retry batch also failed — {type(e).__name__}: {e}", flush=True)
+            if fails: print(f"[weather] {city}: {len(fails)}/{len(locs)} failed — sample: {r[fails[0]][1]}", flush=True)
             recs={}
             for k,res in r.items():
                 if res[0]=="ok":
@@ -393,7 +380,6 @@ class Live:
                     w=g[k][0]; s=synth_weather(w["centroid"][1],w["centroid"][0],now)
                     s["_prov"]="fallback"; recs[k]={"rec":s,"prov":"fallback"}
             self.records[city]=recs
-            _t.sleep(1)
         self.last=now
     def prov(self,city):
         recs=self.records.get(city)
@@ -408,6 +394,29 @@ class Live:
         e=self.records.get(city,{}).get(key)
         return e["rec"] if e else None
 LIVE=Live()
+import time as _time
+_FCACHE={}          # (city, grid-key) -> (fetched_at, extended-range record)
+_FCACHE_TTL=1800     # 30 min — avoids refetching on repeat views of the same ward
+
+def _ward_forecast_rec(city, w):
+    """On-demand extended-range fetch (today + 6-day forecast) for the ONE
+    ward a user is actually viewing right now — not pre-fetched for all 417
+    wards, so it stays well within the free daily record budget. Falls back
+    to None (caller keeps using the cheaper today-only eager record) if this
+    fails for any reason."""
+    c=w["centroid"]; key=(round(c[0]/0.028)*0.028,round(c[1]/0.028)*0.028)
+    now_ts=_time.time()
+    cached=_FCACHE.get((city,key))
+    if cached and now_ts-cached[0]<_FCACHE_TTL:
+        return cached[1]
+    try:
+        rec=fetch_ward_forecast_vc(c[1],c[0])
+        rec["_prov"]="live"
+        _FCACHE[(city,key)]=(now_ts,rec)
+        return rec
+    except Exception as e:
+        print(f"[weather] {city}: on-demand ward forecast fetch failed — {type(e).__name__}: {e}", flush=True)
+        return None
 
 def _series(rec):
     """hourly [(t_dt, tair, rh, wind, sw)] applying sim offset to temps."""
@@ -1161,7 +1170,7 @@ def ward_detail(city,wid):
     city=_norm(city); now=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     w=STORE.ward(city,wid)
     if not w: raise HTTPException(404,"ward not found")
-    rec=LIVE.ward(city,w)
+    rec=_ward_forecast_rec(city,w) or LIVE.ward(city,w)
     snap=compute_snapshot(city,w,rec,now) if rec else None
     if snap and snap.get("ward") is not None:
         snap["ward"]["label"]=ward_label(city,snap["ward"])
